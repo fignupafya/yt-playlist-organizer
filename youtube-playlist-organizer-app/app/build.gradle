@@ -1,0 +1,29 @@
+plugins {
+    // AGP 9+ Kotlin'i yerleşik destekler; .kt dosyaları otomatik derlenir.
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.ypo.organizer'
+    compileSdk 36
+
+    defaultConfig {
+        applicationId "com.ypo.organizer"
+        minSdk 26
+        targetSdk 36
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+}
+
+dependencies {
+    // WebView'in X-Requested-With başlığını kaldırmak ve document-start script
+    // enjekte etmek için (Google'ın WebView girişi engellemesini aşma denemesi).
+    implementation 'androidx.webkit:webkit:1.16.0'
+}

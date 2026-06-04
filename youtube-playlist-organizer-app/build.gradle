@@ -1,0 +1,5 @@
+// Üst düzey build dosyası.
+// AGP 9+ Kotlin desteğini kendi içinde sağlar; ayrı kotlin eklentisi GEREKMEZ.
+plugins {
+    id 'com.android.application' version '9.2.1' apply false
+}

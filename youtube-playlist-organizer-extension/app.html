@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube Playlist Organizer</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo">▶</span>
+      <span id="brand-title">YouTube Playlist Organizer</span>
+    </div>
+    <div id="crumbs"></div>
+    <div class="spacer"></div>
+    <button id="btn-refresh" class="btn">↻ Refresh</button>
+    <button id="btn-settings" class="btn">⚙ Settings</button>
+    <button id="btn-diag" class="btn">🔧 Diagnostics</button>
+  </header>
+
+  <main id="view"></main>
+
+  <div id="status"></div>
+  <div id="modal-root"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# Derleme araçları ve çıktılar
+.buildtools/
+**/build/
+.gradle/
+*.apk
+local.properties
+
+# Node
+node_modules/
+
+# Yerel/makineye özel ayarlar
+.claude/settings.local.json
+
+# OS
+Thumbs.db
+.DS_Store
