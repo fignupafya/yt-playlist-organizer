@@ -27,7 +27,7 @@
   if (window.__ypoMobileLoaded) { return; }
   window.__ypoMobileLoaded = true;
 
-  const VERSION = '1.0';
+  const VERSION = '1.1';
   const LS_SETTINGS = 'ypo_settings_v3';
   const LS_LASTBATCH = 'ypo_lastbatch_v3';
   const RENDER_CHUNK = 200;

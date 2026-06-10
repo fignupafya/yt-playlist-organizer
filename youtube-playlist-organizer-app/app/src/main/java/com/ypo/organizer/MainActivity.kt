@@ -17,6 +17,9 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.WebChromeClient
+import android.webkit.JsResult
+import android.app.AlertDialog
 import java.io.ByteArrayInputStream
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -173,6 +176,28 @@ class MainActivity : Activity() {
                     // Masaüstü www oturumsuz → giriş sayfasına yönlendi → mobil girişe geç.
                     switchToMobileLogin()
                 }
+            }
+        }
+
+        // JS alert/confirm: WebChromeClient OLMADAN confirm() sessizce false döner
+        // (canlı modda "Uygula" çalışmaz). Native AlertDialog ile gerçek onay.
+        web.webChromeClient = object : WebChromeClient() {
+            override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(message)
+                    .setPositiveButton(android.R.string.ok) { _, _ -> result?.confirm() }
+                    .setOnCancelListener { result?.confirm() }
+                    .show()
+                return true
+            }
+            override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                AlertDialog.Builder(this@MainActivity)
+                    .setMessage(message)
+                    .setPositiveButton(android.R.string.ok) { _, _ -> result?.confirm() }
+                    .setNegativeButton(android.R.string.cancel) { _, _ -> result?.cancel() }
+                    .setOnCancelListener { result?.cancel() }
+                    .show()
+                return true
             }
         }
 
