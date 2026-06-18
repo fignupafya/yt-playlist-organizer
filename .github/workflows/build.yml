@@ -33,16 +33,9 @@ jobs:
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon --stacktrace
 
-      # Build artifact (downloads as a .zip from the Actions UI — GitHub always
-      # zips artifacts). The Release below gives a direct, unzipped .apk instead.
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: playlist-organizer-apk
-          path: youtube-playlist-organizer-app/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-
       # Publish/refresh a rolling "latest" prerelease with the raw APK attached.
+      # (No build artifact: the Actions artifact would only download as a .zip;
+      #  the Release gives a direct, unzipped, permanent .apk instead.)
       # Stable download URL:
       #   https://github.com/<owner>/<repo>/releases/download/latest/YouTube-Liste-Duzenleyici.apk
       - name: Publish APK to "latest" Release
