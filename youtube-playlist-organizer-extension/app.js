@@ -10,7 +10,7 @@
  *   (sabit sayı sınırı değil, jeton tekrarı tespitiyle döngü koruması).
  * ==========================================================================*/
 
-const VERSION = '2.2.0';
+const VERSION = '2.3.0';
 const RENDER_CHUNK = 250;   // ekrana parça parça çizim (DOM sınırı değil, akıcılık)
 
 // ---------------------------------------------------------------------------
@@ -143,6 +143,23 @@ const DICT = {
     'Recommended 200–400 ms. Even if very low, on 429 (too many requests) the tool ',
   'otomatik bekleyip yeniden dener. 0 = bekleme yok.': 'auto-waits and retries. 0 = no delay.',
   '↻ Yenile': '↻ Refresh',
+  // --- v2.3: arka plan iş motoru / doğrudan uygula ---
+  '⚡ Direkt Uygula': '⚡ Apply Directly',
+  'CANLI — seçili ': 'LIVE — selected ',
+  ' video arka planda işlenecek.\n\nDevam edilsin mi?': ' videos will be processed in the background.\n\nProceed?',
+  'Senkronla — ': 'Sync — ', 'Kısmi işlem — ': 'Partial — ', 'İşlem — ': 'Operation — ',
+  ' işlem': ' operations', 'Hazırlanıyor…': 'Preparing…',
+  'Listeler okunuyor… ': 'Reading lists… ',
+  'Yönetilen listelerin içeriği okunuyor… ': 'Reading managed lists… ',
+  '" okunamadı: ': '" could not be read: ',
+  ' — hiçbir değişiklik yapılmadı.': ' — no changes were made.',
+  'İptal edildi — ': 'Cancelled — ', 'Hata — ': 'Error — ', ' yapıldı, durdu': ' done, stopped',
+  'DRY-RUN bitti — ': 'DRY-RUN done — ', ' simüle': ' simulated', 'Değişiklik yok': 'No changes',
+  'Bitti — ': 'Done — ', ' hata': ' errors',
+  'İptal et': 'Stop', '⛔ İptal et': '⛔ Stop', 'Ayrıntı için tıkla': 'Click for details',
+  '↩ Bu işi geri al': '↩ Undo this job', '↩ Geri al — ': '↩ Undo — ',
+  'Bu işin TERSİ uygulanacak: ': 'This job will be reversed: ',
+  ' işlem.\n\nDevam edilsin mi?': ' operations.\n\nProceed?',
 };
 // app.html'deki sabit üst-bar metinlerini dile göre ayarla.
 function localizeChrome() {
@@ -642,26 +659,156 @@ function buildPlan(mode, selection, managedList, membership, videoIds, titleOf) 
   }
   return ops;
 }
-async function executePlan(ops, dryRun, onProgress) {
-  const results = [];
-  for (let i = 0; i < ops.length; i++) {
-    const op = ops[i];
-    try {
-      if (dryRun) results.push({ op, ok: true, dryRun: true });
-      else {
-        if (op.type === 'add') await addVideo(op.playlistId, op.videoId);
-        else await removeVideo(op.playlistId, op.videoId, op.setVideoId);
-        results.push({ op, ok: true });
-        await sleep(state.settings.delayMs);
-      }
-    } catch (e) {
-      results.push({ op, ok: false, error: String((e && e.message) || e) });
-      onProgress(i + 1, ops.length, results);
-      return { results, stopped: true };
-    }
-    onProgress(i + 1, ops.length, results);
+// ---------------------------------------------------------------------------
+//  ARKA PLAN İŞ MOTORU (background jobs)
+//  Tasarım: her "iş" kendi yaşam döngüsünü yürütür (oku → planla → uygula) ve
+//  arka planda çalışır; kullanıcı seçim yapmaya devam edebilir. Üstte her iş için
+//  bir çubuk gösterilir (üst üste değil, alt alta). Aynı anda birden çok iş
+//  başlatılabilir.
+//  GÜVENLİK: TÜM yazma istekleri tek bir küresel "kapı"dan, ayardaki gecikmeyle
+//  sıraya dizilerek geçer — kaç iş paralel çalışırsa çalışsın YouTube'a giden
+//  yazma hızı sabit kalır (rate-limit'e ve liste bozulmasına karşı). Bir liste
+//  okunamazsa iş hiç yazmadan iptal olur; ilk yazma hatasında durur; iş başına
+//  geri-al vardır.
+// ---------------------------------------------------------------------------
+const jobs = [];
+let jobSeq = 0;
+let writeGate = Promise.resolve();   // küresel yazma serileştirici (gate)
+
+// Bir yazma isteğini küresel kapıdan, ayardaki gecikmeyle aralıklı geçirir.
+function gatedWrite(fn) {
+  const run = writeGate.then(fn);
+  // Kapı, sonuç ne olursa olsun (başarı/hata) gecikmeyle bir sonrakine devam eder.
+  writeGate = run.then(() => sleep(state.settings.delayMs), () => sleep(state.settings.delayMs));
+  return run;
+}
+
+function jobEmit(job) {
+  job.listeners.forEach((fn) => { try { fn(job); } catch (e) {} });
+  renderJobBars();
+}
+function jobActive(job) { return job.phase === 'preparing' || job.phase === 'applying'; }
+function jobPct(job) {
+  if (job.phase === 'preparing') return job.readTotal ? Math.round((job.readDone / job.readTotal) * 100) : 6;
+  if (job.phase === 'applying') return job.total ? Math.round((job.done / job.total) * 100) : 100;
+  return 100;
+}
+function jobMetaText(job) {
+  if (job.phase === 'preparing') return job.readTotal
+    ? tt('Listeler okunuyor… ') + job.readDone + '/' + job.readTotal : tt('Hazırlanıyor…');
+  if (job.phase === 'applying') return (job.dryRun ? tt('DRY-RUN: ') : '') + job.done + ' / ' + job.total;
+  if (job.phase === 'cancelled') return tt('İptal edildi — ') + job.okCount + '/' + job.total;
+  if (job.phase === 'error') return tt('Hata — ') + job.okCount + tt(' yapıldı, durdu');
+  if (job.dryRun) return tt('DRY-RUN bitti — ') + job.okCount + tt(' simüle');
+  if (job.total === 0) return tt('Değişiklik yok');
+  return tt('Bitti — ') + job.okCount + tt(' işlem') + (job.failCount ? ' (' + job.failCount + tt(' hata') + ')' : '');
+}
+
+// Yeni iş başlat: prepare(job) ops dizisini döndürür (gerekirse listeleri okur).
+function startJob({ title, dryRun, sourceListId, prepare }) {
+  const job = {
+    id: ++jobSeq, title, dryRun: !!dryRun, sourceListId: sourceListId || null,
+    phase: 'preparing',                 // preparing | applying | done | error | cancelled
+    readDone: 0, readTotal: 0,
+    ops: [], total: 0, done: 0, okCount: 0, failCount: 0,
+    results: [], error: null, cancelled: false,
+    listeners: new Set(),
+  };
+  jobs.push(job);
+  renderJobBars();
+  runJobLifecycle(job, prepare);        // ateşle-unut; hatalar içeride yakalanır
+  return job;
+}
+
+async function runJobLifecycle(job, prepare) {
+  try {
+    const ops = await prepare(job);
+    if (job.cancelled) { job.phase = 'cancelled'; jobEmit(job); return; }
+    job.ops = ops; job.total = ops.length; job.phase = 'applying';
+    jobEmit(job);
+    await runJobOps(job);
+  } catch (e) {
+    job.phase = 'error';
+    job.error = String((e && e.message) || e);
+    jobEmit(job);
   }
-  return { results, stopped: false };
+}
+
+async function runJobOps(job) {
+  for (let i = 0; i < job.ops.length; i++) {
+    if (job.cancelled) { job.phase = 'cancelled'; break; }
+    const op = job.ops[i];
+    try {
+      if (job.dryRun) {
+        job.results.push({ op, ok: true, dryRun: true });
+        await sleep(0);                 // ağır kuru-çalıştırmada arayüze nefes aldır
+      } else {
+        if (op.type === 'add') await gatedWrite(() => addVideo(op.playlistId, op.videoId));
+        else await gatedWrite(() => removeVideo(op.playlistId, op.videoId, op.setVideoId));
+        job.results.push({ op, ok: true });
+      }
+      job.okCount++;
+      job.done = job.results.length;
+      jobEmit(job);
+    } catch (e) {
+      job.results.push({ op, ok: false, error: String((e && e.message) || e) });
+      job.failCount++;
+      job.done = job.results.length;
+      job.phase = 'error';              // ilk hatada dur (tutucu)
+      jobEmit(job);
+      break;
+    }
+  }
+  if (job.phase === 'applying') job.phase = 'done';
+  await finalizeJob(job);
+  jobEmit(job);
+}
+
+async function finalizeJob(job) {
+  if (job.dryRun) return;
+  const applied = job.results.filter((r) => r.ok && !r.dryRun).map((r) => r.op);
+  if (applied.length) {
+    state.membershipFresh = false;      // bir sonraki işlem üyeliği taze okur
+    try { await chrome.storage.local.set({ lastBatch: { t: Date.now(), ops: applied } }); } catch (e) {}
+  }
+}
+
+function cancelJob(job) { if (jobActive(job)) { job.cancelled = true; jobEmit(job); } }
+function dismissJob(job) { const i = jobs.indexOf(job); if (i >= 0) jobs.splice(i, 1); renderJobBars(); }
+
+// Doğrudan uygula: pencereyi kapatıp arka planda oku→planla→uygula yapar.
+function startDirectJob(mode, selection, managed, videoIds) {
+  const title = (mode === 'override' ? tt('Senkronla — ') : tt('Kısmi işlem — ')) + videoIds.length + tt(' video');
+  return startJob({
+    title, dryRun: false, sourceListId: state.current ? state.current.id : null,
+    prepare: async (job) => {
+      job.readTotal = managed.length; jobEmit(job);
+      const membership = new Map();
+      const usable = [];
+      for (let i = 0; i < managed.length; i++) {
+        if (job.cancelled) return [];
+        const pl = managed[i];
+        // Bir liste bile okunamazsa: TÜM iş iptal — eksik bilgiyle hiçbir listeye dokunulmaz.
+        try { membership.set(pl.id, await fetchPlaylistVideos(pl.id)); usable.push(pl); }
+        catch (e) { throw new Error('"' + pl.title + tt('" okunamadı: ') + ((e && e.message) || e) + tt(' — hiçbir değişiklik yapılmadı.')); }
+        job.readDone = i + 1; jobEmit(job);
+      }
+      const titleOf = (vid) => { const v = state.vmap.get(vid); return v ? (v.title || vid) : vid; };
+      return buildPlan(mode, selection, usable, membership, videoIds, titleOf);
+    },
+  });
+}
+
+// İş başına geri-al: yapılan (canlı) işlemlerin TERSİNİ yeni bir arka plan işi olarak çalıştırır.
+function undoJobOps(job) {
+  const applied = job.results.filter((r) => r.ok && !r.dryRun).map((r) => r.op);
+  if (!applied.length) return;
+  if (!confirm(tt('Bu işin TERSİ uygulanacak: ') + applied.length + tt(' işlem.\n\nDevam edilsin mi?'))) return;
+  const inverse = applied.map((op) => op.type === 'add'
+    ? { type: 'remove', videoId: op.videoId, videoTitle: op.videoTitle, playlistId: op.playlistId, playlistTitle: op.playlistTitle, setVideoId: null }
+    : { type: 'add', videoId: op.videoId, videoTitle: op.videoTitle, playlistId: op.playlistId, playlistTitle: op.playlistTitle });
+  startJob({ title: tt('↩ Geri al — ') + applied.length + tt(' işlem'), dryRun: false,
+    sourceListId: job.sourceListId, prepare: async () => inverse });
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,7 +1181,13 @@ function updateChips() {
 // ---------------------------------------------------------------------------
 //  MODAL
 // ---------------------------------------------------------------------------
-function closeModal() { clear($('#modal-root')); document.removeEventListener('keydown', escClose); }
+// Modal kapanırken çalışacak temizleyici (ör. canlı iş detayının dinleyici aboneliğini bırakması).
+let modalCleanup = null;
+function closeModal() {
+  clear($('#modal-root'));
+  document.removeEventListener('keydown', escClose);
+  if (modalCleanup) { const c = modalCleanup; modalCleanup = null; try { c(); } catch (e) {} }
+}
 function escClose(e) { if (e.key === 'Escape') closeModal(); }
 function openModal(titleText) {
   closeModal();
@@ -1139,6 +1292,19 @@ function openOperation() {
     state.lastOp = { mode, ov: Object.fromEntries(selOv), pa: Object.fromEntries(selPa) };
     runOperationPreview(m, mode, mode === 'override' ? selOv : selPa, managed, videoIds);
   } }));
+  // Doğrudan uygula: önizleme/bekleme yok — pencere kapanır, işlem arka planda
+  // yürür, üstte ilerleme çubuğu gösterilir. Kullanıcı seçim yapmaya devam edebilir.
+  m.foot.appendChild(h('button', { class: 'btn danger', text: '⚡ Direkt Uygula', onclick: () => {
+    if (mode === 'partial' && !Array.from(selPa.values()).some((v) => v !== 'untouched')) {
+      status('Mod 2: en az bir liste için + veya − seç.', true);
+      return;
+    }
+    state.lastOp = { mode, ov: Object.fromEntries(selOv), pa: Object.fromEntries(selPa) };
+    if (!confirm(tt('CANLI — seçili ') + videoIds.length + tt(' video arka planda işlenecek.\n\nDevam edilsin mi?'))) return;
+    const selection = mode === 'override' ? new Map(selOv) : new Map(selPa);
+    closeModal();
+    startDirectJob(mode, selection, managed.slice(), videoIds.slice());
+  } }));
 }
 
 async function runOperationPreview(m, mode, selection, managed, videoIds) {
@@ -1237,7 +1403,7 @@ function renderPreview(m, ops, backFn, noChange) {
       onclick: () => { closeModal(); backFn(); } }));
     applyBtn.addEventListener('click', () => {
       if (!dryRun && !confirm(tt('CANLI MOD: ') + adds + tt(' ekleme, ') + rems + tt(' çıkarma gerçekten uygulanacak. Devam?'))) return;
-      doExecute(m, ops, dryRun, list);
+      doExecute(m, ops, dryRun);
     });
     m.foot.appendChild(applyBtn);
   } else {
@@ -1248,86 +1414,113 @@ function renderPreview(m, ops, backFn, noChange) {
   }
 }
 
-async function doExecute(m, ops, dryRun, list) {
-  clear(m.foot);
-  const stat = h('div', { text: dryRun ? 'DRY-RUN çalışıyor…' : 'Uygulanıyor…' });
-  const bar = h('div', { class: 'pbar' }, h('i', {}));
-  m.body.insertBefore(bar, m.body.firstChild);
-  m.body.insertBefore(stat, m.body.firstChild);
-
-  const marks = list.querySelectorAll('.st');
-  const onProgress = (done, total, results) => {
-    bar.firstChild.style.width = Math.round((done / total) * 100) + '%';
-    stat.textContent = (dryRun ? 'DRY-RUN: ' : '') + done + ' / ' + total;
-    const last = results[results.length - 1];
-    const mk = marks[results.length - 1];
-    if (last && mk) {
-      mk.textContent = last.ok ? (last.dryRun ? '○' : '✓') : '✗';
-      mk.style.color = last.ok ? (last.dryRun ? 'var(--text-3)' : 'var(--green)') : 'var(--danger)';
-    }
-  };
-
-  const { results, stopped } = await executePlan(ops, dryRun, onProgress);
-  const ok = results.filter((r) => r.ok).length;
-  const fail = results.filter((r) => !r.ok).length;
-
-  if (!dryRun) {
-    state.membershipFresh = false;
-    const applied = results.filter((r) => r.ok && !r.dryRun).map((r) => r.op);
-    if (applied.length) {
-      try { await chrome.storage.local.set({ lastBatch: { t: Date.now(), ops: applied } }); } catch (e) {}
-    }
-  }
-  clear(stat);
-  stat.appendChild(h('b', { text: dryRun ? 'DRY-RUN bitti.' : 'Bitti.' }));
-  stat.appendChild(document.createTextNode(dryRun
-    ? ' ' + ok + tt(' işlem simüle edildi, hiçbir şey yazılmadı.')
-    : ' ' + ok + tt(' başarılı, ') + fail + tt(' hatalı.') + (stopped ? tt(' (ilk hatada durdu)') : '')));
-
-  const fails = results.filter((r) => !r.ok);
-  if (fails.length) {
-    m.body.appendChild(h('div', { class: 'card' },
-      h('div', { class: 'lbl', text: 'Hatalar' }),
-      h('div', { class: 'mono', text: fails.map((r) =>
-        r.op.type + ' ' + r.op.videoTitle + ' → ' + r.op.playlistTitle + '\n   ' + r.error).join('\n\n') })));
-  }
-  clear(m.foot);
-  if (!dryRun && ok > 0) m.foot.appendChild(h('button', { class: 'btn danger', text: '↩ Bu partiyi geri al', onclick: undoLast }));
-  m.foot.appendChild(h('button', { class: 'btn primary', text: 'Kapat', onclick: async () => {
-    closeModal();
-    if (!dryRun && ok > 0 && state.current) await openPlaylist(state.current);
-  } }));
-  if (dryRun) m.body.appendChild(h('div', { class: 'hint',
-    text: 'Sonuç doğruysa: Kapat → tekrar aç → DRY-RUN kutusunu kapat. İlkini bir test listesiyle dene.' }));
+// Önizlemeden "Uygula": planı arka plan işine devreder, pencereyi kapatır ve
+// CANLI detay penceresini açar (kullanıcı kapatırsa iş arka planda sürer).
+function doExecute(m, ops, dryRun) {
+  const job = startJob({
+    title: (dryRun ? tt('DRY-RUN: ') : '') + tt('İşlem — ') + ops.length + tt(' işlem'),
+    dryRun, sourceListId: state.current ? state.current.id : null,
+    prepare: async () => ops,
+  });
+  closeModal();
+  openJobDetail(job);
 }
 
-async function undoLast() {
-  let batch;
-  try { batch = (await chrome.storage.local.get('lastBatch')).lastBatch; } catch (e) {}
-  if (!batch || !batch.ops || !batch.ops.length) { status('Geri alınacak parti yok.', true); return; }
-  if (!confirm(tt('Son parti geri alınacak: ') + batch.ops.length + tt(' işlemin TERSİ uygulanacak. Devam?'))) return;
-  const m = openModal('↩ Geri Al');
-  const stat = h('div', { text: 'Geri alınıyor…' });
+// Bir işin CANLI detay penceresi: ilerleme + işlem listesi + hata + geri-al.
+// İşe abone olur; pencere kapanınca abonelik bırakılır (modalCleanup).
+function openJobDetail(job) {
+  const m = openModal(job.title);
+  const stat = h('div', {});
   const bar = h('div', { class: 'pbar' }, h('i', {}));
+  const statsBox = h('div', { class: 'stats' });
+  const list = h('div', { class: 'oplist' });
+  const errBox = h('div', {});
   m.body.appendChild(stat);
   m.body.appendChild(bar);
-  const inverse = batch.ops.map((op) => op.type === 'add'
-    ? { type: 'remove', videoId: op.videoId, videoTitle: op.videoTitle, playlistId: op.playlistId, playlistTitle: op.playlistTitle, setVideoId: null }
-    : { type: 'add', videoId: op.videoId, videoTitle: op.videoTitle, playlistId: op.playlistId, playlistTitle: op.playlistTitle });
-  const { results } = await executePlan(inverse, false, (done, total) => {
-    bar.firstChild.style.width = Math.round((done / total) * 100) + '%';
-    stat.textContent = tt('Geri alınıyor: ') + done + ' / ' + total;
-  });
-  const ok = results.filter((r) => r.ok).length;
-  state.membershipFresh = false;
-  clear(stat);
-  stat.appendChild(h('b', { text: 'Geri alma bitti.' }));
-  stat.appendChild(document.createTextNode(' ' + ok + ' / ' + results.length + tt(' başarılı.')));
-  try { await chrome.storage.local.remove('lastBatch'); } catch (e) {}
-  m.foot.appendChild(h('button', { class: 'btn primary', text: 'Kapat', onclick: async () => {
-    closeModal();
-    if (state.current) await openPlaylist(state.current);
-  } }));
+  m.body.appendChild(statsBox);
+  m.body.appendChild(list);
+  m.body.appendChild(errBox);
+
+  let built = false;
+  const buildList = () => {
+    built = true;
+    clear(statsBox); clear(list);
+    const adds = job.ops.filter((o) => o.type === 'add').length;
+    const rems = job.ops.filter((o) => o.type === 'remove').length;
+    statsBox.appendChild(h('div', { class: 'stat add' }, h('div', { class: 'n', text: String(adds) }), h('div', { class: 'l', text: 'ekleme' })));
+    statsBox.appendChild(h('div', { class: 'stat rem' }, h('div', { class: 'n', text: String(rems) }), h('div', { class: 'l', text: 'çıkarma' })));
+    job.ops.forEach((op) => {
+      list.appendChild(h('div', { class: 'op' },
+        h('span', { class: 'tag ' + (op.type === 'add' ? 'add' : 'rem'), text: op.type === 'add' ? 'EKLE' : 'ÇIKAR' }),
+        h('span', { class: 'v', text: op.videoTitle, title: op.videoId }),
+        h('span', { class: 'p', text: '→ ' + op.playlistTitle }),
+        h('span', { class: 'st' })));
+    });
+  };
+
+  const update = () => {
+    bar.firstChild.style.width = jobPct(job) + '%';
+    if (job.phase === 'preparing') {
+      stat.textContent = job.readTotal
+        ? tt('Yönetilen listelerin içeriği okunuyor… ') + job.readDone + '/' + job.readTotal
+        : tt('Hazırlanıyor…');
+    } else {
+      if (!built) buildList();
+      stat.textContent = jobMetaText(job);
+      const marks = list.querySelectorAll('.st');
+      for (let i = 0; i < job.results.length && i < marks.length; i++) {
+        const r = job.results[i];
+        marks[i].textContent = r.ok ? (r.dryRun ? '○' : '✓') : '✗';
+        marks[i].style.color = r.ok ? (r.dryRun ? 'var(--text-3)' : 'var(--green)') : 'var(--danger)';
+      }
+    }
+    clear(errBox);
+    if (job.error) {
+      errBox.appendChild(h('div', { class: 'card' },
+        h('div', { class: 'lbl', text: 'Hatalar' }), h('div', { class: 'mono', text: job.error })));
+    } else {
+      const fails = job.results.filter((r) => !r.ok);
+      if (fails.length) errBox.appendChild(h('div', { class: 'card' },
+        h('div', { class: 'lbl', text: 'Hatalar' }),
+        h('div', { class: 'mono', text: fails.map((r) =>
+          r.op.type + ' ' + r.op.videoTitle + ' → ' + r.op.playlistTitle + '\n   ' + r.error).join('\n\n') })));
+    }
+    clear(m.foot);
+    if (jobActive(job)) {
+      m.foot.appendChild(h('button', { class: 'btn ghost', text: '⛔ İptal et', onclick: () => cancelJob(job) }));
+    } else if (!job.dryRun && job.okCount > 0) {
+      m.foot.appendChild(h('button', { class: 'btn danger', text: '↩ Bu işi geri al',
+        onclick: () => { closeModal(); undoJobOps(job); } }));
+    }
+    m.foot.appendChild(h('button', { class: 'btn primary', text: 'Kapat', onclick: closeModal }));
+  };
+
+  update();
+  job.listeners.add(update);
+  modalCleanup = () => job.listeners.delete(update);
+}
+
+// Üstteki iş çubukları — her iş için bir çubuk, alt alta. Çubuğa tıkla → detay.
+function renderJobBars() {
+  let host = $('#jobbars');
+  if (!host) { host = h('div', { id: 'jobbars' }); document.body.appendChild(host); }
+  clear(host);
+  for (const job of jobs) {
+    const fill = h('i', { style: { width: jobPct(job) + '%' } });
+    const x = h('button', { class: 'jb-x', text: '✕',
+      title: jobActive(job) ? 'İptal et' : 'Kapat',
+      onclick: (e) => { e.stopPropagation(); if (jobActive(job)) cancelJob(job); else dismissJob(job); } });
+    const titleEl = h('span', { class: 'jb-title' });
+    const metaEl = h('div', { class: 'jb-meta' });
+    titleEl.textContent = job.title;
+    metaEl.textContent = jobMetaText(job);
+    const barEl = h('div', { class: 'jobbar ' + job.phase + (job.dryRun ? ' dry' : ''),
+      title: 'Ayrıntı için tıkla', onclick: () => openJobDetail(job) },
+      h('div', { class: 'jb-top' }, titleEl, x),
+      h('div', { class: 'jb-track' }, fill),
+      metaEl);
+    host.appendChild(barEl);
+  }
 }
 
 // ---------------------------------------------------------------------------

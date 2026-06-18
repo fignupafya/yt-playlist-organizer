@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Liste Düzenleyici",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "YouTube oynatma listelerini topluca düzenle: videoları seç, birden çok listeye aynı anda ekle/çıkar. Override ve Include/Exclude modları, önizleme, geri-al.",
   "permissions": ["scripting", "tabs", "storage"],
   "host_permissions": ["https://www.youtube.com/*"],

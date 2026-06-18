@@ -35,6 +35,10 @@ session — exactly the requests your browser makes when you tick a box in the
     removed; every selected video's membership is synced exactly to the boxes.
   - **Include / Exclude** — per playlist: **+ Add / · Leave / − Remove**.
     “Leave” playlists are never touched.
+- **⚡ Direct Apply (background)** — skip preview/wait: fire the operation straight
+  to the background. A progress bar appears at the top so you can keep selecting;
+  tap it to reopen the live details. Start several operations at once — the bars
+  stack vertically, and all writes stay safely rate-limited.
 - Watch-progress bars, archive-membership chips, filter / sort / search.
 - No item cap (all videos are read via continuation tokens).
 - **Safety:** dry-run default · mandatory preview · never creates duplicates
@@ -70,7 +74,8 @@ sideloaded app — choose “Install anyway”). On first launch, sign in to You
 
 1. Open the tool → your playlists appear.
 2. Open a playlist → select videos.
-3. **Operate** → choose a mode → set each target playlist → **Preview** → apply.
+3. **Operate** → choose a mode → set each target playlist → **Preview** → apply,
+   or **⚡ Apply Directly** to run it in the background while you keep working.
 4. **Dry-run is on by default** — it shows exactly what will happen and writes
    nothing. Try it on a test playlist first.
 
@@ -121,6 +126,10 @@ isteklerin aynısı.
     çıkarılır; seçili her videonun üyeliği kutulara birebir eşitlenir.
   - **Include / Exclude (kısmi)** — her liste için: **+ Ekle / · Dokunma /
     − Çıkar**. “Dokunma” listelere hiç dokunulmaz.
+- **⚡ Direkt Uygula (arka plan)** — önizleme/bekleme yok; işlem doğrudan arka
+  planda yürür. Üstte ilerleme çubuğu çıkar, sen seçime devam edebilirsin; çubuğa
+  dokununca canlı detay tekrar açılır. Aynı anda birden çok işlem başlatabilirsin —
+  çubuklar alt alta dizilir, tüm yazmalar güvenli hızda sıraya alınır.
 - İzlenme çubukları, arşiv-üyelik rozetleri, filtre / sıralama / arama.
 - Limit yok (tüm videolar devam-jetonuyla okunur).
 - **Güvenlik:** varsayılan dry-run · zorunlu önizleme · kopya oluşturmaz
@@ -148,7 +157,8 @@ yükle”). İlk açılışta bir kez YouTube'a giriş yap.
 ## Kullanım
 1. Aracı aç → listelerin gelir.
 2. Listeye gir → videoları seç.
-3. **İşlem Yap** → mod seç → her hedef listeyi ayarla → **Önizle** → uygula.
+3. **İşlem Yap** → mod seç → her hedef listeyi ayarla → **Önizle** → uygula, ya da
+   **⚡ Direkt Uygula** ile çalışmaya devam ederken arka planda çalıştır.
 4. **Dry-run varsayılan açık** — ne olacağını gösterir, hiçbir şey yazmaz. Önce bir
    test listesinde dene.
 

@@ -27,7 +27,7 @@
   if (window.__ypoMobileLoaded) { return; }
   window.__ypoMobileLoaded = true;
 
-  const VERSION = '1.1';
+  const VERSION = '1.2';
   const LS_SETTINGS = 'ypo_settings_v3';
   const LS_LASTBATCH = 'ypo_lastbatch_v3';
   const RENDER_CHUNK = 200;
@@ -152,6 +152,22 @@
     ' işlem simüle edildi.': ' operations simulated.',
     '• context: ': '• context: ', '• SAPISID çerezi: ': '• SAPISID cookie: ',
     '• Playlist okuma testi…': '• Playlist read test…', ' video, ': ' videos, ',
+    // --- v1.2: arka plan iş motoru / doğrudan uygula ---
+    '⚡ Direkt Uygula': '⚡ Apply Directly',
+    'CANLI — seçili ': 'LIVE — selected ',
+    ' video arka planda işlenecek.\n\nDevam edilsin mi?': ' videos will be processed in the background.\n\nProceed?',
+    'Senkronla — ': 'Sync — ', 'Kısmi işlem — ': 'Partial — ', 'İşlem — ': 'Operation — ',
+    ' işlem': ' operations', 'Hazırlanıyor…': 'Preparing…',
+    'Listeler okunuyor… ': 'Reading lists… ',
+    '" okunamadı: ': '" could not be read: ',
+    ' — hiçbir değişiklik yapılmadı.': ' — no changes were made.',
+    'İptal edildi — ': 'Cancelled — ', 'Hata — ': 'Error — ', ' yapıldı, durdu': ' done, stopped',
+    'DRY-RUN bitti — ': 'DRY-RUN done — ', ' simüle': ' simulated', 'Değişiklik yok': 'No changes',
+    'Bitti — ': 'Done — ', ' hata': ' errors',
+    'İptal et': 'Stop', '⛔ İptal et': '⛔ Stop', 'Ayrıntı için tıkla': 'Click for details',
+    '↩ Bu işi geri al': '↩ Undo this job', '↩ Geri al — ': '↩ Undo — ',
+    'Bu işin TERSİ uygulanacak: ': 'This job will be reversed: ',
+    ' işlem.\n\nDevam edilsin mi?': ' operations.\n\nProceed?',
   };
   function tt(s) {
     if (state.settings.lang === 'tr') { return s; }
@@ -769,30 +785,148 @@
     }
     return ops;
   }
-  async function executePlan(ops, dryRun, onProgress) {
-    const results = [];
-    for (let i = 0; i < ops.length; i++) {
-      const op = ops[i];
-      try {
-        if (dryRun) {
-          results.push({ op: op, ok: true, dryRun: true });
-        } else {
-          if (op.type === 'add') {
-            await addVideo(op.playlistId, op.videoId);
-          } else {
-            await removeVideo(op.playlistId, op.videoId, op.setVideoId);
-          }
-          results.push({ op: op, ok: true });
-          await sleep(state.settings.delayMs);
-        }
-      } catch (e) {
-        results.push({ op: op, ok: false, error: String((e && e.message) || e) });
-        onProgress(i + 1, ops.length, results);
-        return { results: results, stopped: true };
-      }
-      onProgress(i + 1, ops.length, results);
+  // -------------------------------------------------------------------------
+  //  ARKA PLAN İŞ MOTORU (background jobs)
+  //  Her "iş" arka planda yürür (oku → planla → uygula); kullanıcı seçime devam
+  //  edebilir. Üstte her iş için alt alta bir çubuk gösterilir; aynı anda birden
+  //  çok iş başlatılabilir. GÜVENLİK: tüm yazma istekleri tek küresel "kapı"dan,
+  //  ayardaki gecikmeyle sıraya dizilerek geçer — kaç iş paralel olursa olsun
+  //  YouTube'a giden yazma hızı sabit kalır. Liste okunamazsa iş hiç yazmadan
+  //  iptal; ilk yazma hatasında durur; iş başına geri-al vardır.
+  // -------------------------------------------------------------------------
+  const jobs = [];
+  let jobSeq = 0;
+  let writeGate = Promise.resolve();
+
+  function gatedWrite(fn) {
+    const run = writeGate.then(fn);
+    writeGate = run.then(function () { return sleep(state.settings.delayMs); },
+                         function () { return sleep(state.settings.delayMs); });
+    return run;
+  }
+  function jobEmit(job) {
+    job.listeners.forEach(function (fn) { try { fn(job); } catch (e) {} });
+    renderJobBars();
+  }
+  function jobActive(job) { return job.phase === 'preparing' || job.phase === 'applying'; }
+  function jobPct(job) {
+    if (job.phase === 'preparing') { return job.readTotal ? Math.round((job.readDone / job.readTotal) * 100) : 6; }
+    if (job.phase === 'applying') { return job.total ? Math.round((job.done / job.total) * 100) : 100; }
+    return 100;
+  }
+  function jobMetaText(job) {
+    if (job.phase === 'preparing') {
+      return job.readTotal ? tt('Listeler okunuyor… ') + job.readDone + '/' + job.readTotal : tt('Hazırlanıyor…');
     }
-    return { results: results, stopped: false };
+    if (job.phase === 'applying') { return (job.dryRun ? tt('DRY-RUN: ') : '') + job.done + ' / ' + job.total; }
+    if (job.phase === 'cancelled') { return tt('İptal edildi — ') + job.okCount + '/' + job.total; }
+    if (job.phase === 'error') { return tt('Hata — ') + job.okCount + tt(' yapıldı, durdu'); }
+    if (job.dryRun) { return tt('DRY-RUN bitti — ') + job.okCount + tt(' simüle'); }
+    if (job.total === 0) { return tt('Değişiklik yok'); }
+    return tt('Bitti — ') + job.okCount + tt(' işlem') + (job.failCount ? ' (' + job.failCount + tt(' hata') + ')' : '');
+  }
+  function startJob(opts) {
+    const job = {
+      id: ++jobSeq, title: opts.title, dryRun: !!opts.dryRun, sourceListId: opts.sourceListId || null,
+      phase: 'preparing', readDone: 0, readTotal: 0,
+      ops: [], total: 0, done: 0, okCount: 0, failCount: 0,
+      results: [], error: null, cancelled: false, listeners: new Set(),
+    };
+    jobs.push(job);
+    renderJobBars();
+    runJobLifecycle(job, opts.prepare);
+    return job;
+  }
+  async function runJobLifecycle(job, prepare) {
+    try {
+      const ops = await prepare(job);
+      if (job.cancelled) { job.phase = 'cancelled'; jobEmit(job); return; }
+      job.ops = ops; job.total = ops.length; job.phase = 'applying';
+      jobEmit(job);
+      await runJobOps(job);
+    } catch (e) {
+      job.phase = 'error';
+      job.error = String((e && e.message) || e);
+      jobEmit(job);
+    }
+  }
+  async function runJobOps(job) {
+    for (let i = 0; i < job.ops.length; i++) {
+      if (job.cancelled) { job.phase = 'cancelled'; break; }
+      const op = job.ops[i];
+      try {
+        if (job.dryRun) {
+          job.results.push({ op: op, ok: true, dryRun: true });
+          await sleep(0);
+        } else {
+          if (op.type === 'add') { await gatedWrite(function () { return addVideo(op.playlistId, op.videoId); }); }
+          else { await gatedWrite(function () { return removeVideo(op.playlistId, op.videoId, op.setVideoId); }); }
+          job.results.push({ op: op, ok: true });
+        }
+        job.okCount++;
+        job.done = job.results.length;
+        jobEmit(job);
+      } catch (e) {
+        job.results.push({ op: op, ok: false, error: String((e && e.message) || e) });
+        job.failCount++;
+        job.done = job.results.length;
+        job.phase = 'error';
+        jobEmit(job);
+        break;
+      }
+    }
+    if (job.phase === 'applying') { job.phase = 'done'; }
+    finalizeJob(job);
+    jobEmit(job);
+  }
+  function finalizeJob(job) {
+    if (job.dryRun) { return; }
+    const applied = [];
+    for (const r of job.results) { if (r.ok && !r.dryRun) { applied.push(r.op); } }
+    if (applied.length) {
+      state.membershipFresh = false;
+      try { localStorage.setItem(LS_LASTBATCH, JSON.stringify({ ops: applied })); } catch (e) {}
+    }
+  }
+  function cancelJob(job) { if (jobActive(job)) { job.cancelled = true; jobEmit(job); } }
+  function dismissJob(job) { const i = jobs.indexOf(job); if (i >= 0) { jobs.splice(i, 1); } renderJobBars(); }
+
+  // Doğrudan uygula: pencereyi kapatıp arka planda oku→planla→uygula yapar.
+  function startDirectJob(mode, selection, managed, videoIds) {
+    const title = (mode === 'override' ? tt('Senkronla — ') : tt('Kısmi işlem — ')) + videoIds.length + tt(' video');
+    return startJob({
+      title: title, dryRun: false, sourceListId: state.current ? state.current.id : null,
+      prepare: async function (job) {
+        job.readTotal = managed.length; jobEmit(job);
+        const membership = new Map();
+        const usable = [];
+        for (let i = 0; i < managed.length; i++) {
+          if (job.cancelled) { return []; }
+          const pl = managed[i];
+          // Bir liste bile okunamazsa: TÜM iş iptal — eksik bilgiyle dokunulmaz.
+          try { membership.set(pl.id, await fetchPlaylistVideos(pl.id)); usable.push(pl); }
+          catch (e) { throw new Error('"' + pl.title + tt('" okunamadı: ') + ((e && e.message) || e) + tt(' — hiçbir değişiklik yapılmadı.')); }
+          job.readDone = i + 1; jobEmit(job);
+        }
+        function titleOf(vid) { const v = state.vmap.get(vid); return v ? (v.title || vid) : vid; }
+        return buildPlan(mode, selection, usable, membership, videoIds, titleOf);
+      },
+    });
+  }
+  // İş başına geri-al: yapılan (canlı) işlemlerin TERSİNİ yeni bir arka plan işi olarak çalıştırır.
+  function undoJobOps(job) {
+    const applied = [];
+    for (const r of job.results) { if (r.ok && !r.dryRun) { applied.push(r.op); } }
+    if (!applied.length) { return; }
+    if (!confirm(tt('Bu işin TERSİ uygulanacak: ') + applied.length + tt(' işlem.\n\nDevam edilsin mi?'))) { return; }
+    const inverse = applied.map(function (op) {
+      if (op.type === 'add') {
+        return { type: 'remove', videoId: op.videoId, videoTitle: op.videoTitle, playlistId: op.playlistId, playlistTitle: op.playlistTitle, setVideoId: null };
+      }
+      return { type: 'add', videoId: op.videoId, videoTitle: op.videoTitle, playlistId: op.playlistId, playlistTitle: op.playlistTitle };
+    });
+    startJob({ title: tt('↩ Geri al — ') + applied.length + tt(' işlem'), dryRun: false,
+      sourceListId: job.sourceListId, prepare: async function () { return inverse; } });
   }
 
   // -------------------------------------------------------------------------
@@ -922,7 +1056,7 @@
   .ypo-shead h3{margin:0;font-size:15.5px;font-weight:800;flex:1}
   .ypo-x{appearance:none;background:none;border:none;color:#9a9aa6;font-size:19px;cursor:pointer}
   .ypo-sbody{padding:15px 16px;overflow-y:auto;display:flex;flex-direction:column;gap:13px}
-  .ypo-sfoot{padding:11px 16px;border-top:1px solid #2a2a31;display:flex;gap:8px;
+  .ypo-sfoot{padding:11px 16px;border-top:1px solid #2a2a31;display:flex;gap:8px;flex-wrap:wrap;
     padding-bottom:calc(11px + env(safe-area-inset-bottom))}
   .ypo-sfoot .ypo-btn{flex:1}
 
@@ -988,10 +1122,35 @@
   #ypo-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   #ypo-toast.err{background:#3a1715;border-color:#f0433a}
 
+  /* arka plan iş çubukları (background job bars) */
+  #ypo-jobbars{position:absolute;top:calc(54px + env(safe-area-inset-top));left:8px;right:8px;z-index:9;
+    display:flex;flex-direction:column;gap:8px;pointer-events:none}
+  #ypo-jobbars:empty{display:none}
+  .ypo-jobbar{pointer-events:auto;background:#1f1f24;border:1px solid #3b3b44;border-left:3px solid #3ea6ff;
+    border-radius:10px;padding:9px 11px;box-shadow:0 6px 18px rgba(0,0,0,.5);animation:ypo-up .18s ease}
+  .ypo-jobbar.preparing{border-left-color:#e8b53a}
+  .ypo-jobbar.applying{border-left-color:#3ea6ff}
+  .ypo-jobbar.done{border-left-color:#34d058}
+  .ypo-jobbar.error{border-left-color:#f0433a}
+  .ypo-jobbar.cancelled{border-left-color:#66666f}
+  .ypo-jb-top{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+  .ypo-jb-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;font-size:12.5px}
+  .ypo-jobbar.dry .ypo-jb-title::after{content:"DRY";margin-left:6px;font-size:9px;font-weight:800;color:#e8b53a;
+    border:1px solid rgba(232,181,58,.5);border-radius:4px;padding:1px 4px}
+  .ypo-jb-x{appearance:none;background:none;border:none;color:#66666f;font-size:15px;padding:2px 8px;cursor:pointer;flex:none}
+  .ypo-jb-track{height:7px;background:#2c2c33;border-radius:5px;overflow:hidden}
+  .ypo-jb-track i{display:block;height:100%;width:0;background:#3ea6ff;transition:width .2s}
+  .ypo-jobbar.preparing .ypo-jb-track i{background:#e8b53a}
+  .ypo-jobbar.done .ypo-jb-track i{background:#34d058}
+  .ypo-jobbar.error .ypo-jb-track i{background:#f0433a}
+  .ypo-jobbar.cancelled .ypo-jb-track i{background:#66666f}
+  .ypo-jb-meta{margin-top:6px;color:#9a9aa6;font-size:11px;font-weight:600}
+
   @media(min-width:760px){
     .ypo-body{padding:20px;max-width:1180px;margin:0 auto;width:100%}
     .ypo-grid{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}
     .ypo-vthumb{width:150px}
+    #ypo-jobbars{left:auto;width:340px}
   }`;
   function injectStyle() {
     if ($id('ypo-style')) { return; }
@@ -1016,6 +1175,7 @@
       top,
       h('div', { class: 'ypo-body', id: 'ypo-bodyview' }),
       h('div', { class: 'ypo-bottom', id: 'ypo-bottombar' }),
+      h('div', { id: 'ypo-jobbars' }),
       h('div', { id: 'ypo-toast' }),
       h('div', { id: 'ypo-sheet-host' }));
     document.body.appendChild(root);
@@ -1469,7 +1629,12 @@
   // -------------------------------------------------------------------------
   //  SHEET
   // -------------------------------------------------------------------------
-  function closeSheet() { clear($id('ypo-sheet-host')); }
+  // Sheet kapanırken çalışacak temizleyici (canlı iş detayının aboneliğini bırakması).
+  let sheetCleanup = null;
+  function closeSheet() {
+    clear($id('ypo-sheet-host'));
+    if (sheetCleanup) { const c = sheetCleanup; sheetCleanup = null; try { c(); } catch (e) {} }
+  }
   function openSheet(title) {
     closeSheet();
     const body = h('div', { class: 'ypo-sbody' });
@@ -1582,6 +1747,23 @@
         }
         state.lastOp = { mode: mode, ov: Object.fromEntries(selOv), pa: Object.fromEntries(selPa) };
         runOperationPreview(mode, mode === 'override' ? selOv : selPa, managed, videoIds);
+      },
+    }));
+    // Doğrudan uygula: önizleme/bekleme yok — sheet kapanır, işlem arka planda
+    // yürür, üstte ilerleme çubuğu gösterilir. Kullanıcı seçime devam edebilir.
+    m.foot.appendChild(h('button', {
+      class: 'ypo-btn dng', style: { flexBasis: '100%' }, text: '⚡ Direkt Uygula',
+      onclick: function () {
+        if (mode === 'partial') {
+          let any = false;
+          for (const v of selPa.values()) { if (v !== 'untouched') { any = true; break; } }
+          if (!any) { toast('En az bir liste için + veya − seç.', true); return; }
+        }
+        state.lastOp = { mode: mode, ov: Object.fromEntries(selOv), pa: Object.fromEntries(selPa) };
+        if (!confirm(tt('CANLI — seçili ') + videoIds.length + tt(' video arka planda işlenecek.\n\nDevam edilsin mi?'))) { return; }
+        const selection = mode === 'override' ? new Map(selOv) : new Map(selPa);
+        closeSheet();
+        startDirectJob(mode, selection, managed.slice(), videoIds.slice());
       },
     }));
   }
@@ -1712,117 +1894,115 @@
         const ok = confirm(tt('CANLI MOD: ') + adds + tt(' ekleme, ') + rems + tt(' çıkarma gerçekten uygulanacak. Devam?'));
         if (!ok) { return; }
       }
-      doExecute(m, ops, dryRun, list);
+      doExecute(m, ops, dryRun);
     });
     m.foot.appendChild(applyBtn);
   }
 
-  async function doExecute(m, ops, dryRun, list) {
-    clear(m.foot);
-    const stat = h('div', { text: dryRun ? 'DRY-RUN çalışıyor…' : 'Uygulanıyor…' });
-    const bar = h('div', { class: 'ypo-pbar' }, h('i', {}));
-    m.body.insertBefore(bar, m.body.firstChild);
-    m.body.insertBefore(stat, m.body.firstChild);
-    const marks = list.querySelectorAll('.st');
-    function onProgress(done, total, results) {
-      bar.firstChild.style.width = Math.round((done / total) * 100) + '%';
-      stat.textContent = (dryRun ? 'DRY-RUN: ' : '') + done + ' / ' + total;
-      const last = results[results.length - 1];
-      const mk = marks[results.length - 1];
-      if (last && mk) {
-        if (last.ok) { mk.textContent = last.dryRun ? '○' : '✓'; }
-        else { mk.textContent = '✗'; }
-        if (last.ok) { mk.style.color = last.dryRun ? '#66666f' : '#34d058'; }
-        else { mk.style.color = '#f0433a'; }
-      }
-    }
-    const result = await executePlan(ops, dryRun, onProgress);
-    const results = result.results;
-    const stopped = result.stopped;
-    const ok = results.filter(function (r) { return r.ok; }).length;
-    const fail = results.filter(function (r) { return !r.ok; }).length;
-    if (!dryRun) {
-      state.membershipFresh = false;
-      const applied = [];
-      for (const r of results) {
-        if (r.ok && !r.dryRun) { applied.push(r.op); }
-      }
-      if (applied.length) {
-        try { localStorage.setItem(LS_LASTBATCH, JSON.stringify({ ops: applied })); } catch (e) {}
-      }
-    }
-    clear(stat);
-    stat.appendChild(h('b', { text: dryRun ? 'DRY-RUN bitti.' : 'Bitti.' }));
-    let tail = '';
-    if (dryRun) {
-      tail = ' ' + ok + tt(' işlem simüle edildi.');
-    } else {
-      tail = ' ' + ok + tt(' başarılı, ') + fail + tt(' hatalı.') + (stopped ? tt(' (ilk hatada durdu)') : '');
-    }
-    stat.appendChild(document.createTextNode(tail));
-    const fails = results.filter(function (r) { return !r.ok; });
-    if (fails.length) {
-      const lines = fails.map(function (r) {
-        return r.op.videoTitle + ' → ' + r.op.playlistTitle + '\n  ' + r.error;
-      }).join('\n\n');
-      m.body.appendChild(h('div', { class: 'ypo-card' },
-        h('div', { class: 'ypo-lbl', text: 'Hatalar' }),
-        h('div', { class: 'ypo-mono', text: lines })));
-    }
-    clear(m.foot);
-    if (!dryRun && ok > 0) {
-      m.foot.appendChild(h('button', { class: 'ypo-btn dng', text: '↩ Geri al', onclick: undoLast }));
-    }
-    m.foot.appendChild(h('button', {
-      class: 'ypo-btn pri wide', text: 'Kapat',
-      onclick: function () {
-        closeSheet();
-        if (!dryRun && ok > 0 && state.current) { openPlaylist(state.current); }
-      },
-    }));
+  // Önizlemeden "Uygula": planı arka plan işine devreder, sheet'i kapatır ve
+  // CANLI detay sheet'ini açar (kullanıcı kapatırsa iş arka planda sürer).
+  function doExecute(m, ops, dryRun) {
+    const job = startJob({
+      title: (dryRun ? tt('DRY-RUN: ') : '') + tt('İşlem — ') + ops.length + tt(' işlem'),
+      dryRun: dryRun, sourceListId: state.current ? state.current.id : null,
+      prepare: async function () { return ops; },
+    });
+    closeSheet();
+    openJobDetail(job);
   }
 
-  async function undoLast() {
-    let batch;
-    try { batch = JSON.parse(localStorage.getItem(LS_LASTBATCH) || 'null'); } catch (e) {}
-    if (!batch || !batch.ops || !batch.ops.length) {
-      toast('Geri alınacak parti yok.', true);
-      return;
-    }
-    if (!confirm(tt('Son parti geri alınacak: ') + batch.ops.length + tt(' işlemin TERSİ uygulanacak. Devam?'))) {
-      return;
-    }
-    const m = openSheet('↩ Geri Al');
-    const stat = h('div', { text: 'Geri alınıyor…' });
+  // Bir işin CANLI detay sheet'i: ilerleme + işlem listesi + hata + geri-al.
+  // İşe abone olur; sheet kapanınca abonelik bırakılır (sheetCleanup).
+  function openJobDetail(job) {
+    const m = openSheet(job.title);
+    const stat = h('div', {});
     const bar = h('div', { class: 'ypo-pbar' }, h('i', {}));
+    const statsBox = h('div', { class: 'ypo-stats' });
+    const list = h('div', { class: 'ypo-oplist' });
+    const errBox = h('div', {});
     m.body.appendChild(stat);
     m.body.appendChild(bar);
-    const inverse = batch.ops.map(function (op) {
-      if (op.type === 'add') {
-        return {
-          type: 'remove', videoId: op.videoId, videoTitle: op.videoTitle,
-          playlistId: op.playlistId, playlistTitle: op.playlistTitle, setVideoId: null,
-        };
+    m.body.appendChild(statsBox);
+    m.body.appendChild(list);
+    m.body.appendChild(errBox);
+
+    let built = false;
+    function buildList() {
+      built = true;
+      clear(statsBox); clear(list);
+      const adds = job.ops.filter(function (o) { return o.type === 'add'; }).length;
+      const rems = job.ops.filter(function (o) { return o.type === 'remove'; }).length;
+      statsBox.appendChild(h('div', { class: 'ypo-stat a' }, h('div', { class: 'n', text: String(adds) }), h('div', { class: 'l', text: 'ekleme' })));
+      statsBox.appendChild(h('div', { class: 'ypo-stat r' }, h('div', { class: 'n', text: String(rems) }), h('div', { class: 'l', text: 'çıkarma' })));
+      for (const op of job.ops) {
+        list.appendChild(h('div', { class: 'ypo-op' },
+          h('span', { class: 'ypo-tag ' + (op.type === 'add' ? 'a' : 'r'), text: op.type === 'add' ? 'EKLE' : 'ÇIKAR' }),
+          h('span', { class: 'v', text: op.videoTitle }),
+          h('span', { class: 'p', text: '→ ' + op.playlistTitle }),
+          h('span', { class: 'st' })));
       }
-      return {
-        type: 'add', videoId: op.videoId, videoTitle: op.videoTitle,
-        playlistId: op.playlistId, playlistTitle: op.playlistTitle,
-      };
-    });
-    const result = await executePlan(inverse, false, function (done, total) {
-      bar.firstChild.style.width = Math.round((done / total) * 100) + '%';
-      stat.textContent = tt('Geri alınıyor: ') + done + ' / ' + total;
-    });
-    const ok = result.results.filter(function (r) { return r.ok; }).length;
-    state.membershipFresh = false;
-    clear(stat);
-    stat.appendChild(h('b', { text: 'Geri alma bitti. ' }));
-    stat.appendChild(document.createTextNode(ok + ' / ' + result.results.length + ' başarılı.'));
-    try { localStorage.removeItem(LS_LASTBATCH); } catch (e) {}
-    m.foot.appendChild(h('button', {
-      class: 'ypo-btn pri wide', text: 'Kapat',
-      onclick: function () { closeSheet(); if (state.current) { openPlaylist(state.current); } },
-    }));
+    }
+    function update() {
+      bar.firstChild.style.width = jobPct(job) + '%';
+      if (job.phase === 'preparing') {
+        stat.textContent = job.readTotal
+          ? tt('Listeler okunuyor… ') + job.readDone + '/' + job.readTotal : tt('Hazırlanıyor…');
+      } else {
+        if (!built) { buildList(); }
+        stat.textContent = jobMetaText(job);
+        const marks = list.querySelectorAll('.st');
+        for (let i = 0; i < job.results.length && i < marks.length; i++) {
+          const r = job.results[i];
+          marks[i].textContent = r.ok ? (r.dryRun ? '○' : '✓') : '✗';
+          marks[i].style.color = r.ok ? (r.dryRun ? '#66666f' : '#34d058') : '#f0433a';
+        }
+      }
+      clear(errBox);
+      if (job.error) {
+        errBox.appendChild(h('div', { class: 'ypo-card' },
+          h('div', { class: 'ypo-lbl', text: 'Hatalar' }), h('div', { class: 'ypo-mono', text: job.error })));
+      } else {
+        const fails = job.results.filter(function (r) { return !r.ok; });
+        if (fails.length) {
+          const lines = fails.map(function (r) { return r.op.videoTitle + ' → ' + r.op.playlistTitle + '\n  ' + r.error; }).join('\n\n');
+          errBox.appendChild(h('div', { class: 'ypo-card' },
+            h('div', { class: 'ypo-lbl', text: 'Hatalar' }), h('div', { class: 'ypo-mono', text: lines })));
+        }
+      }
+      clear(m.foot);
+      if (jobActive(job)) {
+        m.foot.appendChild(h('button', { class: 'ypo-btn gho wide', text: '⛔ İptal et', onclick: function () { cancelJob(job); } }));
+      } else if (!job.dryRun && job.okCount > 0) {
+        m.foot.appendChild(h('button', { class: 'ypo-btn dng', text: '↩ Bu işi geri al', onclick: function () { closeSheet(); undoJobOps(job); } }));
+      }
+      m.foot.appendChild(h('button', { class: 'ypo-btn pri wide', text: 'Kapat', onclick: closeSheet }));
+    }
+
+    update();
+    job.listeners.add(update);
+    sheetCleanup = function () { job.listeners.delete(update); };
+  }
+
+  // Üstteki iş çubukları — her iş için bir çubuk, alt alta. Çubuğa dokun → detay.
+  function renderJobBars() {
+    const host = $id('ypo-jobbars');
+    if (!host) { return; }
+    clear(host);
+    for (const job of jobs) {
+      const fill = h('i', { style: { width: jobPct(job) + '%' } });
+      const x = h('button', { class: 'ypo-jb-x', text: '✕', title: jobActive(job) ? 'İptal et' : 'Kapat',
+        onclick: function (e) { e.stopPropagation(); if (jobActive(job)) { cancelJob(job); } else { dismissJob(job); } } });
+      const titleEl = h('span', { class: 'ypo-jb-title' });
+      const metaEl = h('div', { class: 'ypo-jb-meta' });
+      titleEl.textContent = job.title;
+      metaEl.textContent = jobMetaText(job);
+      const barEl = h('div', { class: 'ypo-jobbar ' + job.phase + (job.dryRun ? ' dry' : ''),
+        title: 'Ayrıntı için tıkla', onclick: function () { openJobDetail(job); } },
+        h('div', { class: 'ypo-jb-top' }, titleEl, x),
+        h('div', { class: 'ypo-jb-track' }, fill),
+        metaEl);
+      host.appendChild(barEl);
+    }
   }
 
   // -------------------------------------------------------------------------
